@@ -1,0 +1,16 @@
+# Encrypted gp3 EBS volumes, provisioned by the EBS CSI driver add-on.
+# WaitForFirstConsumer creates the volume in the same Availability Zone as the pod that uses it.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-encrypted
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+  fsType: ext4
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

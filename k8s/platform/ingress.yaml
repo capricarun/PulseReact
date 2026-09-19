@@ -1,0 +1,36 @@
+# Internet-facing Application Load Balancer (AWS Load Balancer Controller).
+# All traffic goes to the frontend nginx pods; nginx forwards /api/* to the backend inside the cluster.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: pulse
+  namespace: pulse
+  labels:
+    app.kubernetes.io/part-of: pulse
+  annotations:
+    alb.ingress.kubernetes.io/load-balancer-name: pulse-alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip # send traffic straight to pod IPs (needed for readiness gates)
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "10"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+    alb.ingress.kubernetes.io/tags: Project=pulse,Environment=prod
+    # Optional HTTPS (needs an ACM certificate for your own domain):
+    # alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:ap-south-1:<ACCOUNT_ID>:certificate/<ID>
+    # alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    # alb.ingress.kubernetes.io/ssl-redirect: "443"
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

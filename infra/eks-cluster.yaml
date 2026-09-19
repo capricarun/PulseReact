@@ -1,0 +1,88 @@
+# eksctl cluster definition for Project-04.
+# ${AWS_ACCOUNT_ID} is filled in with envsubst before use (see the guide):
+#   envsubst '${AWS_ACCOUNT_ID}' < infra/eks-cluster.yaml > eks-cluster.rendered.yaml
+#   eksctl create cluster -f eks-cluster.rendered.yaml
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: pulse-eks
+  region: ap-south-1
+  version: "1.35"
+  tags:
+    Project: pulse
+    Environment: prod
+
+# New VPC 192.168.0.0/16: public subnets (ALB, NAT gateway) + private subnets (worker nodes) in several AZs
+vpc:
+  cidr: 192.168.0.0/16
+  nat:
+    gateway: Single # one NAT gateway keeps the cost down (use HighlyAvailable for real production)
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+
+# Cluster access is managed with EKS access entries (no aws-auth ConfigMap).
+# The IAM identity that runs eksctl automatically becomes cluster admin.
+accessConfig:
+  authenticationMode: API
+
+iam:
+  # EKS Pod Identity is used instead of IRSA, so no OIDC provider is needed
+  withOIDC: false
+  podIdentityAssociations:
+    # AWS Load Balancer Controller: creates and manages the ALB for the Ingress
+    - namespace: kube-system
+      serviceAccountName: aws-load-balancer-controller
+      roleName: pulse-eks-aws-load-balancer-controller
+      wellKnownPolicies:
+        awsLoadBalancerController: true
+    # External Secrets Operator: read-only access to the pulse/* secrets and nothing else
+    - namespace: external-secrets
+      serviceAccountName: external-secrets
+      roleName: pulse-eks-external-secrets
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: "arn:aws:secretsmanager:ap-south-1:${AWS_ACCOUNT_ID}:secret:pulse/*"
+
+addonsConfig:
+  # Add-ons that need AWS permissions (VPC CNI, EBS CSI driver) get their own roles via Pod Identity
+  autoApplyPodIdentityAssociations: true
+
+addons:
+  - name: vpc-cni
+    configurationValues: |-
+      enableNetworkPolicy: "true"
+  - name: coredns
+  - name: kube-proxy
+  - name: eks-pod-identity-agent
+  - name: aws-ebs-csi-driver
+  - name: metrics-server
+
+managedNodeGroups:
+  - name: pulse-workers
+    instanceType: t3.large # 2 vCPU / 8 GiB / up to 35 pods per node
+    amiFamily: AmazonLinux2023
+    minSize: 2
+    desiredCapacity: 2
+    maxSize: 3
+    volumeSize: 30
+    volumeType: gp3
+    volumeEncrypted: true
+    privateNetworking: true # nodes get no public IP addresses
+    disableIMDSv1: true
+    labels:
+      workload: general
+    tags:
+      Project: pulse
+
+# Optional (adds CloudWatch Logs cost): control-plane audit logs for security investigations
+# cloudWatch:
+#   clusterLogging:
+#     enableTypes: ["audit", "authenticator"]
+#     logRetentionInDays: 7

@@ -1,0 +1,15 @@
+# Namespace for the whole application.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pulse
+  labels:
+    app.kubernetes.io/part-of: pulse
+    # AWS Load Balancer Controller: a new pod only counts as Ready once its ALB target is healthy.
+    # This is what makes rolling updates zero-downtime behind the ALB.
+    elbv2.k8s.aws/pod-readiness-gate-inject: enabled
+    # Pod Security Admission: reject any pod that runs as root, escalates privileges, etc.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

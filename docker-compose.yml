@@ -1,0 +1,70 @@
+# Local end-to-end run of all three tiers (evidence for the Docker section).
+# From the repo root, after creating backend/.env and frontend/.env from their .env.example files:
+#   docker compose --env-file backend/.env --env-file frontend/.env up -d --build
+# Open http://localhost:8080
+name: pulse
+
+services:
+  mysql:
+    image: public.ecr.aws/docker/library/mysql:8.4
+    environment:
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes" # root password is generated at first start, never stored in Git
+      DB_USER: ${DB_USER:?set DB_USER in backend/.env}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in backend/.env}
+      DB_NAME: ${DB_NAME:?set DB_NAME in backend/.env}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./backend/sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./k8s/database/create-app-user.sh:/docker-entrypoint-initdb.d/02-create-app-user.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$DB_PASSWORD\" mysql -h 127.0.0.1 -u \"$$DB_USER\" -e 'SELECT 1' > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks: [data]
+
+  backend:
+    build:
+      context: ./backend
+    image: pulse-backend:local
+    env_file: ./backend/.env
+    environment:
+      DB_HOST: mysql # service name on the "data" network
+      TRUST_PROXY_HOPS: "1" # nginx is in front of the API
+    depends_on:
+      mysql:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [app, data]
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/api}
+    image: pulse-frontend:local
+    environment:
+      BACKEND_UPSTREAM: backend:4000
+    ports:
+      - "8080:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /etc/nginx/conf.d
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [app]
+
+volumes:
+  mysql-data:
+
+# The frontend cannot reach MySQL: it is not on the "data" network
+networks:
+  app:
+  data:

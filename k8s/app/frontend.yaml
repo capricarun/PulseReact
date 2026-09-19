@@ -1,0 +1,122 @@
+# Frontend tier (React build on unprivileged nginx): ConfigMap + Deployment + PDB. Applied by the pipeline via scripts/deploy.sh,
+# which replaces ${FRONTEND_IMAGE} with the versioned ECR image.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: pulse
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: pulse
+data:
+  # host:port of the backend Service that nginx forwards /api/* to
+  BACKEND_UPSTREAM: backend:4000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: pulse
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: pulse
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/component: web
+        app.kubernetes.io/part-of: pulse
+    spec:
+      serviceAccountName: pulse-frontend
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101 # "nginx" user from nginx-unprivileged
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: frontend
+      containers:
+        - name: frontend
+          image: ${FRONTEND_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: frontend-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          lifecycle:
+            preStop: # give the ALB time to deregister the pod before nginx stops
+              sleep:
+                seconds: 15
+          volumeMounts:
+            # Writable scratch space for a read-only root filesystem
+            - name: tmp
+              mountPath: /tmp
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: nginx-conf
+          emptyDir: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend
+  namespace: pulse
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/part-of: pulse
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend

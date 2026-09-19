@@ -1,0 +1,70 @@
+# Helm values for prometheus-community/kube-prometheus-stack
+# Prometheus + Alertmanager + Grafana + kube-state-metrics (pod status/restarts) + node-exporter (node health)
+
+# EKS runs the control plane for you: these targets cannot be scraped, so turn them off
+# (otherwise Prometheus shows them as "down" and fires false alerts).
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    retention: 5d
+    # Discover ServiceMonitors / PrometheusRules in every namespace (e.g. the backend ServiceMonitor in "pulse")
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        memory: 1536Mi
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3-encrypted
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+
+grafana:
+  # Admin credentials come from a Kubernetes Secret created on the command line - not from this file
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  defaultDashboardsTimezone: browser
+  # Load every ConfigMap labelled grafana_dashboard=1 as a dashboard (used by pulse-dashboard.yaml)
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+  # Loki (installed in the "logging" namespace) for centralised logs in Grafana Explore
+  additionalDataSources:
+    - name: Loki
+      type: loki
+      uid: loki
+      access: proxy
+      url: http://loki.logging.svc.cluster.local:3100
+      jsonData:
+        maxLines: 1000
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi

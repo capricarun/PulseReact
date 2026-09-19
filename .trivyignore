@@ -1,0 +1,4 @@
+# Accepted findings. Trivy reads this file automatically when it runs from the repository root.
+# Only add an entry after reviewing it, and always write why it is safe and when to re-check it.
+# Format: one ID per line, e.g.
+# CVE-2099-12345   # Not exploitable here: the vulnerable feature is not used. Owner: <you>. Review by: 2026-12-31

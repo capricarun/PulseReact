@@ -1,0 +1,46 @@
+# Rendered at container start by the nginx image entrypoint (envsubst).
+# Only ${BACKEND_UPSTREAM} is substituted (see NGINX_ENVSUBST_FILTER in the Dockerfile);
+# nginx's own $variables are left untouched.
+server {
+    listen      8080;
+    server_name _;
+    server_tokens off;
+
+    root  /usr/share/nginx/html;
+    index index.html;
+
+    # Health endpoint for Docker HEALTHCHECK, Kubernetes probes and the ALB health check
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # The browser calls /api/* on the same origin; nginx forwards it to the backend Service.
+    # The backend is never exposed to the internet on its own.
+    location /api/ {
+        proxy_pass            http://${BACKEND_UPSTREAM};
+        proxy_http_version    1.1;
+        proxy_set_header      Host              $host;
+        proxy_set_header      X-Real-IP         $remote_addr;
+        proxy_set_header      X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header      X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    30s;
+        client_max_body_size  1m;
+    }
+
+    # Vite puts fingerprinted files in /assets, so they can be cached for a year
+    location /assets/ {
+        include    /etc/nginx/snippets/security-headers.conf;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files  $uri =404;
+    }
+
+    # React Router: unknown paths such as /login or /register fall back to index.html
+    location / {
+        include    /etc/nginx/snippets/security-headers.conf;
+        add_header Cache-Control "no-cache" always;
+        try_files  $uri $uri/ /index.html;
+    }
+}
