@@ -36,7 +36,7 @@ export default function Feed() {
   return (
     <div className="feed">
       <div className="feed-header">
-        <h1>Right now</h1>
+        <h1>Right now (v2 on EKS)</h1>
         <p>Every post, newest first — no algorithm between you and the moment.</p>
       </div>
 
