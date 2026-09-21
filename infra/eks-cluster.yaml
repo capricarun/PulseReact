@@ -66,15 +66,15 @@ addons:
 
 managedNodeGroups:
   - name: pulse-workers
-    instanceType: t3.large # 2 vCPU / 8 GiB / up to 35 pods per node
+    instanceType: t3.small
     amiFamily: AmazonLinux2023
-    minSize: 2
+    minSize: 1
     desiredCapacity: 2
-    maxSize: 3
-    volumeSize: 30
+    maxSize: 2
+    volumeSize: 20
     volumeType: gp3
     volumeEncrypted: true
-    privateNetworking: true # nodes get no public IP addresses
+    privateNetworking: true
     disableIMDSv1: true
     labels:
       workload: general
