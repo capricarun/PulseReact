@@ -1,0 +1,19 @@
+# Tells Prometheus to scrape the backend's /metrics endpoint (application metrics) every 30 seconds.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: blog-backend
+  namespace: blog
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: blog
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  namespaceSelector:
+    matchNames: ["blog"]
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

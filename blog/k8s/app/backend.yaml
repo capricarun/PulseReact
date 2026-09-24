@@ -1,0 +1,135 @@
+# Backend tier (Express API): ConfigMap + Deployment + PodDisruptionBudget. Applied by the pipeline via scripts/deploy.sh,
+# which replaces ${BACKEND_IMAGE} with the versioned ECR image and ${APP_URL} with the ALB URL.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: blog
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: blog
+data:
+  NODE_ENV: production
+  PORT: "4000"
+  CORS_ORIGIN: ${APP_URL}
+  TRUST_PROXY_HOPS: "2" # ALB + nginx sit in front of the API
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: blog
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: blog
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1 # start one new pod first...
+      maxUnavailable: 0 # ...and never drop below 2 ready pods
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: blog
+    spec:
+      serviceAccountName: blog-backend
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000 # "node" user from the image
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: backend
+      containers:
+        - name: backend
+          image: ${BACKEND_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 4000
+          envFrom:
+            - configMapRef:
+                name: backend-config
+            - configMapRef:
+                name: blog-db-config
+          env:
+            # Only the two secrets the API needs (not the MySQL root password)
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: blog-app-secrets
+                  key: DB_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: blog-app-secrets
+                  key: JWT_SECRET
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          readinessProbe: # take the pod out of the Service if it cannot reach MySQL
+            httpGet:
+              path: /api/ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe: # restart the container if the Node.js process hangs
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop: # keep serving for 10s while endpoints are removed, then SIGTERM -> graceful shutdown
+              sleep:
+                seconds: 10
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend
+  namespace: blog
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: blog
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend

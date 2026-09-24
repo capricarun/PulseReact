@@ -1,0 +1,270 @@
+// CI/CD pipeline for the Marginal blog (the blog/ folder of this repository).
+// A second Jenkins Pipeline job, next to the Pulse job: Script Path = blog/Jenkinsfile.
+// It shares the Pulse tools (SonarQube, Nexus, Trivy, ECR, the pulse-eks cluster) but deploys to its own
+// "blog" namespace, behind its own ALB (blog-alb). Pushes that do not touch blog/ are skipped.
+// GitHub push -> Checkout -> Build -> Test -> SonarQube -> Quality Gate -> Docker Build -> Trivy
+//             -> Image Versioning -> Push (Nexus + ECR) -> EKS Deployment (rolling) -> Deployment Validation
+pipeline {
+  agent any
+
+  options {
+    skipDefaultCheckout(true)
+    disableConcurrentBuilds()
+    timestamps()
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    timeout(time: 60, unit: 'MINUTES')
+  }
+
+  triggers {
+    githubPush() // GitHub webhook -> http://<JENKINS_IP>:8080/github-webhook/
+  }
+
+  tools {
+    nodejs 'node24' // Manage Jenkins -> Tools -> NodeJS installations
+  }
+
+  environment {
+    AWS_REGION     = 'ap-south-1'
+    CLUSTER_NAME   = 'pulse-eks'
+    K8S_NAMESPACE  = 'blog'
+    NEXUS_REGISTRY = 'localhost:8083' // Nexus Docker (hosted) repository connector on this server
+    BACKEND_REPO   = 'blog-backend'
+    FRONTEND_REPO  = 'blog-frontend'
+    SCANNER_HOME   = tool 'sonar-scanner' // Manage Jenkins -> Tools -> SonarQube Scanner installations
+    KUBECONFIG     = "${WORKSPACE}/.kube/config" // per-build kubeconfig, never shared between jobs
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        script {
+          def scmVars = checkout scm
+          // Build only when blog/ changed since the last successful build (always on the first or a manual build)
+          def previous = scmVars.GIT_PREVIOUS_SUCCESSFUL_COMMIT
+          def manual = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause').size() > 0
+          def unchanged = previous && !manual &&
+            sh(script: "git diff --quiet ${previous} HEAD -- blog/", returnStatus: true) == 0
+          env.BLOG_CHANGED = unchanged ? 'false' : 'true'
+          if (unchanged) {
+            currentBuild.result = 'NOT_BUILT'
+            currentBuild.description = 'No changes in blog/ - skipped'
+            echo 'No changes under blog/ since the last successful build - nothing to deploy'
+          }
+
+          env.GIT_SHORT      = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
+          env.IMAGE_TAG      = "${env.BUILD_NUMBER}-${env.GIT_SHORT}" // unique, traceable version e.g. 42-a1b2c3d
+          env.AWS_ACCOUNT_ID = sh(script: 'aws sts get-caller-identity --query Account --output text', returnStdout: true).trim()
+          env.ECR_REGISTRY   = "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+          currentBuild.displayName = "#${env.BUILD_NUMBER} (${env.IMAGE_TAG})"
+        }
+        sh 'git log -1 --pretty="Commit %h by %an: %s"'
+      }
+    }
+
+    stage('Build') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        dir('blog/backend') {
+          sh 'npm ci --no-audit --no-fund'
+        }
+        dir('blog/frontend') {
+          sh 'npm ci --no-audit --no-fund'
+          sh 'VITE_API_URL=/api npm run build'
+        }
+      }
+    }
+
+    stage('Test') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        dir('blog/backend') {
+          sh 'npm test'
+          // LCOV paths are relative to backend/; prefix them so SonarQube (run from the repo root) can match the files
+          sh "sed -i 's#^SF:#SF:backend/#' coverage/lcov.info"
+        }
+        dir('blog/frontend') {
+          sh 'npm test'
+        }
+      }
+      post {
+        always {
+          junit allowEmptyResults: true, testResults: 'blog/backend/test-results/*.xml, blog/frontend/test-results/*.xml'
+        }
+      }
+    }
+
+    stage('SonarQube Analysis') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        withSonarQubeEnv('sonarqube') { // Manage Jenkins -> System -> SonarQube servers (name must match)
+          dir('blog') { // reads blog/sonar-project.properties (its own SonarQube project: marginal-blog)
+            sh '"${SCANNER_HOME}/bin/sonar-scanner" -Dsonar.projectVersion="${IMAGE_TAG}"'
+          }
+        }
+      }
+    }
+
+    stage('Quality Gate') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        timeout(time: 10, unit: 'MINUTES') {
+          // Waits for SonarQube's webhook; aborts the pipeline (so nothing is deployed) if the gate fails
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+
+    stage('Docker Build') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        sh '''
+          docker build --pull \
+            --build-arg APP_VERSION="${IMAGE_TAG}" \
+            -t "${BACKEND_REPO}:${IMAGE_TAG}" blog/backend
+
+          docker build --pull \
+            --build-arg APP_VERSION="${IMAGE_TAG}" \
+            --build-arg VITE_API_URL=/api \
+            -t "${FRONTEND_REPO}:${IMAGE_TAG}" blog/frontend
+
+          docker image ls --filter "reference=blog-*:${IMAGE_TAG}"
+        '''
+      }
+    }
+
+    stage('Trivy Scan') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        sh '''
+          mkdir -p reports
+
+          # 1) Repository: leaked secrets + Dockerfile/Kubernetes misconfigurations (HIGH/CRITICAL fail the build)
+          trivy fs --scanners secret,misconfig --severity HIGH,CRITICAL --exit-code 1 --no-progress \
+            --skip-dirs blog/backend/node_modules --skip-dirs blog/frontend/node_modules --skip-dirs blog/frontend/dist blog
+
+          for IMAGE in "${BACKEND_REPO}:${IMAGE_TAG}" "${FRONTEND_REPO}:${IMAGE_TAG}"; do
+            NAME="${IMAGE%%:*}"
+            # 2) Full vulnerability report (all severities) kept as build evidence: JSON + HTML
+            trivy image --scanners vuln --no-progress --format json --output "reports/trivy-${NAME}.json" "${IMAGE}"
+            trivy convert --format template --template "@/usr/local/share/trivy/templates/html.tpl" \
+              --output "reports/trivy-${NAME}.html" "reports/trivy-${NAME}.json"
+            # 3) Gate: block deployment on HIGH/CRITICAL vulnerabilities that already have a fixed version
+            trivy image --scanners vuln --no-progress --skip-db-update \
+              --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "${IMAGE}"
+          done
+        '''
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage('Image Versioning') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        sh '''
+          for REPO in "${BACKEND_REPO}" "${FRONTEND_REPO}"; do
+            docker tag "${REPO}:${IMAGE_TAG}" "${NEXUS_REGISTRY}/${REPO}:${IMAGE_TAG}"
+            docker tag "${REPO}:${IMAGE_TAG}" "${ECR_REGISTRY}/${REPO}:${IMAGE_TAG}"
+          done
+          docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -F ":${IMAGE_TAG}"
+        '''
+      }
+    }
+
+    stage('Push to Nexus and ECR') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'nexus-docker', usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
+          sh '''
+            echo "${NEXUS_PASS}" | docker login "${NEXUS_REGISTRY}" -u "${NEXUS_USER}" --password-stdin
+            docker push "${NEXUS_REGISTRY}/${BACKEND_REPO}:${IMAGE_TAG}"
+            docker push "${NEXUS_REGISTRY}/${FRONTEND_REPO}:${IMAGE_TAG}"
+            docker logout "${NEXUS_REGISTRY}"
+          '''
+        }
+        // ECR login uses the EC2 instance role - no AWS keys stored in Jenkins
+        sh '''
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login "${ECR_REGISTRY}" -u AWS --password-stdin
+          docker push "${ECR_REGISTRY}/${BACKEND_REPO}:${IMAGE_TAG}"
+          docker push "${ECR_REGISTRY}/${FRONTEND_REPO}:${IMAGE_TAG}"
+          docker logout "${ECR_REGISTRY}"
+        '''
+      }
+    }
+
+    stage('EKS Deployment') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        script {
+          sh '''
+            mkdir -p "$(dirname "${KUBECONFIG}")"
+            aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --kubeconfig "${KUBECONFIG}"
+          '''
+          try {
+            sh '''
+              export BACKEND_IMAGE="${ECR_REGISTRY}/${BACKEND_REPO}:${IMAGE_TAG}"
+              export FRONTEND_IMAGE="${ECR_REGISTRY}/${FRONTEND_REPO}:${IMAGE_TAG}"
+              bash blog/scripts/deploy.sh
+            '''
+          } catch (err) {
+            echo 'Rollout did not complete - rolling back to the previous version'
+            sh '''
+              kubectl -n "${K8S_NAMESPACE}" rollout undo deployment/backend  || true
+              kubectl -n "${K8S_NAMESPACE}" rollout undo deployment/frontend || true
+            '''
+            throw err
+          }
+        }
+      }
+    }
+
+    stage('Deployment Validation') {
+      when { expression { env.BLOG_CHANGED == 'true' } }
+      steps {
+        script {
+          try {
+            sh '''
+              APP_URL="http://$(kubectl -n "${K8S_NAMESPACE}" get ingress blog -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+              echo "Application URL: ${APP_URL}"
+              kubectl -n "${K8S_NAMESPACE}" get deployments,pods -o wide
+              kubectl -n "${K8S_NAMESPACE}" get deployment backend frontend \
+                -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.template.spec.containers[0].image}{"\\n"}{end}'
+              bash blog/scripts/smoke-test.sh "${APP_URL}"
+            '''
+          } catch (err) {
+            echo 'Smoke tests failed - rolling back to the previous version'
+            sh '''
+              kubectl -n "${K8S_NAMESPACE}" rollout undo deployment/backend  || true
+              kubectl -n "${K8S_NAMESPACE}" rollout undo deployment/frontend || true
+              kubectl -n "${K8S_NAMESPACE}" rollout status deployment/backend  --timeout=300s || true
+              kubectl -n "${K8S_NAMESPACE}" rollout status deployment/frontend --timeout=300s || true
+            '''
+            throw err
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      script {
+        if (env.BLOG_CHANGED == 'true') {
+          echo "Deployed ${env.IMAGE_TAG} to ${env.CLUSTER_NAME} (namespace ${env.K8S_NAMESPACE})"
+        }
+      }
+    }
+    always {
+      // Remove local image copies so the build server's disk does not fill up
+      sh '''
+        for REPO in "${BACKEND_REPO}" "${FRONTEND_REPO}"; do
+          docker image rm -f "${REPO}:${IMAGE_TAG}" "${NEXUS_REGISTRY}/${REPO}:${IMAGE_TAG}" "${ECR_REGISTRY}/${REPO}:${IMAGE_TAG}" 2>/dev/null || true
+        done
+        docker image prune -f > /dev/null 2>&1 || true
+      '''
+    }
+  }
+}

@@ -1,0 +1,70 @@
+# Least-privilege identities.
+# 1) One ServiceAccount per workload, with no Kubernetes API token mounted (the apps never call the API).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blog-frontend
+  namespace: blog
+  labels:
+    app.kubernetes.io/part-of: blog
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blog-backend
+  namespace: blog
+  labels:
+    app.kubernetes.io/part-of: blog
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: blog-mysql
+  namespace: blog
+  labels:
+    app.kubernetes.io/part-of: blog
+automountServiceAccountToken: false
+---
+# 2) What the Jenkins pipeline may do: roll out the app layer in this namespace only.
+#    It cannot read Secrets, change Services, Ingress, RBAC or network policies, or touch the database.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: blog-deployer
+  namespace: blog
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+---
+# 3) Bind the Role to a Kubernetes group. The Jenkins IAM role is mapped into this group by an EKS access entry.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: blog-deployer
+  namespace: blog
+subjects:
+  - kind: Group
+    name: pulse-deployers
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: blog-deployer
+  apiGroup: rbac.authorization.k8s.io

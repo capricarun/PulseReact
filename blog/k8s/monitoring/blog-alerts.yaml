@@ -1,0 +1,52 @@
+# Alert rules for the Marginal blog application (visible in Prometheus -> Alerts and Alertmanager).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: blog-alerts
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: blog
+spec:
+  groups:
+    - name: blog.availability
+      rules:
+        - alert: BlogPodRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="blog"}[15m]) > 2
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod {{ $labels.pod }} restarted more than 2 times in 15 minutes"
+            description: "Check the previous container logs: kubectl -n blog logs {{ $labels.pod }} -c {{ $labels.container }} --previous"
+        - alert: BlogDeploymentReplicasMissing
+          expr: kube_deployment_status_replicas_available{namespace="blog"} < kube_deployment_spec_replicas{namespace="blog"}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Deployment {{ $labels.deployment }} has fewer available replicas than desired"
+        - alert: BlogDatabaseNotReady
+          expr: kube_statefulset_status_replicas_ready{namespace="blog", statefulset="mysql"} < 1
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "The MySQL StatefulSet has no ready replica"
+    - name: blog.api
+      rules:
+        - alert: BlogApiHighErrorRate
+          expr: |
+            sum(rate(blog_http_requests_total{namespace="blog", status_code=~"5.."}[5m]))
+              / clamp_min(sum(rate(blog_http_requests_total{namespace="blog"}[5m])), 1e-9) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "More than 5% of API requests are failing with HTTP 5xx"
+        - alert: BlogApiSlowResponses
+          expr: histogram_quantile(0.95, sum by (le) (rate(blog_http_request_duration_seconds_bucket{namespace="blog"}[5m]))) > 1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "API p95 latency has been above 1 second for 10 minutes"

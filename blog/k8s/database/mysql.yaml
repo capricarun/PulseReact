@@ -1,0 +1,167 @@
+# Database tier: MySQL 8.4 LTS as a StatefulSet with an encrypted EBS volume.
+# Prerequisites (applied earlier): namespace, storage class, ServiceAccounts, the "blog-app-secrets" Secret (ESO)
+# and the "mysql-init" ConfigMap created from backend/sql/schema.sql + k8s/database/create-app-user.sh.
+
+# Non-secret database settings shared by MySQL and the backend
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blog-db-config
+  namespace: blog
+  labels:
+    app.kubernetes.io/part-of: blog
+data:
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_NAME: blogdb
+  DB_USER: blog_app
+---
+# Headless Service: stable DNS name "mysql" (and mysql-0.mysql) inside the namespace only - never exposed outside
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: blog
+  labels:
+    app.kubernetes.io/name: mysql
+    app.kubernetes.io/part-of: blog
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: blog
+  labels:
+    app.kubernetes.io/name: mysql
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: blog
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mysql
+  # Keep the data volume even if the StatefulSet is deleted or scaled down
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mysql
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: blog
+    spec:
+      serviceAccountName: blog-mysql
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60 # let InnoDB flush and shut down cleanly
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999 # "mysql" user inside the official image
+        runAsGroup: 999
+        fsGroup: 999 # makes the EBS volume writable for that user
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mysql
+          image: public.ecr.aws/docker/library/mysql:8.4
+          # Data lives in a sub-directory: a fresh ext4 EBS volume contains "lost+found", which MySQL refuses to initialise over
+          args: ["--datadir=/var/lib/mysql/data"]
+          ports:
+            - name: mysql
+              containerPort: 3306
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: blog-app-secrets
+                  key: MYSQL_ROOT_PASSWORD
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: blog-app-secrets
+                  key: DB_PASSWORD
+            - name: DB_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: blog-db-config
+                  key: DB_USER
+            - name: DB_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: blog-db-config
+                  key: DB_NAME
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true # only the volumes below are writable
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # First start runs the init scripts with networking disabled, so allow up to 5 minutes
+          startupProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          # Ready = the application user can actually log in and run a query
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "MYSQL_PWD=\"$DB_PASSWORD\" mysql -h 127.0.0.1 -u \"$DB_USER\" -e 'SELECT 1' > /dev/null"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Alive = mysqld answers (restart the container if it hangs)
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            - name: run # socket and pid file
+              mountPath: /var/run/mysqld
+            - name: tmp # temporary tables and files
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: init-scripts
+          configMap:
+            name: mysql-init
+            defaultMode: 0444 # not executable, so the entrypoint sources the .sh file
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: mysql
+          app.kubernetes.io/part-of: blog
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: gp3-encrypted
+        resources:
+          requests:
+            storage: 10Gi
