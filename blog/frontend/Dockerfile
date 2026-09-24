@@ -29,8 +29,13 @@ LABEL org.opencontainers.image.title="blog-frontend" \
 ENV BACKEND_UPSTREAM=backend:4000 \
     NGINX_ENVSUBST_FILTER=BACKEND_UPSTREAM
 
-# Replace the default site with our template (rendered to /etc/nginx/conf.d/default.conf at start-up)
-RUN rm -f /etc/nginx/conf.d/default.conf
+# Replace the default site with our template (rendered to /etc/nginx/conf.d/default.conf at start-up).
+# Install Alpine security fixes that are newer than the base image (e.g. libexpat CVE-2026-93990 -> 2.8.5),
+# so the Trivy gate does not block on OS packages that already have a patched version.
+# apk needs root; the image switches back to the unprivileged nginx user (101) below.
+USER root
+RUN apk upgrade --no-cache \
+ && rm -f /etc/nginx/conf.d/default.conf
 COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
 COPY nginx/security-headers.conf /etc/nginx/snippets/security-headers.conf
 COPY --from=build /app/dist /usr/share/nginx/html
